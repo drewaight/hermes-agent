@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 from agent.deadline import kill_process_tree
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
-from tools.environments.local import hermes_subprocess_env
+from agent.transports.codex_app_server_env import codex_subprocess_env
 
 MIN_CODEX_VERSION = (0, 125, 0)
 
@@ -91,20 +91,10 @@ class CodexAppServerClient:
     def __init__(
         self, codex_bin: str = "codex", codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None, env: Optional[dict[str, str]] = None,
+        model_provider: Optional[str] = None,
     ) -> None:
         self._codex_bin = codex_bin
-        # codex needs LLM provider creds but must not receive Tier-1 Hermes secrets (gateway/GitHub/infra tokens).
-        # codex app-server is a model-driving CLI executor: it runs a model-chosen agentic loop that
-        # executes shell commands, so it legitimately needs LLM provider credentials
-        # (inherit_credentials=True) to authenticate against the model endpoint. But the previous
-        # `os.environ.copy()` also handed it every Tier-1 Hermes secret — gateway bot tokens, GitHub auth,
-        # Modal/Daytona infra tokens, the dashboard session token, AUXILIARY_* side-LLM keys,
-        # GATEWAY_RELAY_* auth — none of which a coding subprocess has any use for. Route through the
-        # centralized helper so Tier-1 + dynamic-internal secrets are always stripped while provider creds
-        # still flow, matching copilot_acp_client (#29157 sibling spawn-site gap).
-        spawn_env = hermes_subprocess_env(inherit_credentials=True)
-        if env:
-            spawn_env.update(env)
+        spawn_env = codex_subprocess_env(codex_home, model_provider, overrides=env)
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
@@ -119,7 +109,7 @@ class CodexAppServerClient:
         # the whole executor process ownership.
         owned_task = os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context()
         if owned_task:
-            for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+            for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_PROFILE"):
                 if key in os.environ:
                     cmd += ["-c", f"mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.env.{key}={json.dumps(os.environ[key])}"]
             cmd += ["-c", f'mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.env.{DELEGATED_CHILD_ENV_MARKER}=""']

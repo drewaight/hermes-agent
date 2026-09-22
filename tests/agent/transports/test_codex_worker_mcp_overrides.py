@@ -42,7 +42,7 @@ def launch(monkeypatch, tmp_path):
     """Return ``launch(env) -> list[str]`` of the ``mcp_servers.*`` overrides in the worker argv."""
     _RecordingPopen.commands = []
     monkeypatch.setattr(subprocess, "Popen", _RecordingPopen)
-    for key in (*KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+    for key in (*KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_PROFILE"):
         monkeypatch.delenv(key, raising=False)
 
     def _launch(env: dict[str, str]) -> list[str]:
@@ -70,6 +70,7 @@ def test_worker_overrides_target_the_migrated_server(launch, tmp_path):
     overrides = launch({
         "HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111",
         "HERMES_KANBAN_RUN_ID": "42",
+        "HERMES_PROFILE": "turing",
         "HERMES_KANBAN_DB": str(tmp_path / "board" / "kanban.db"),
     })
     assert overrides, "dispatcher-owned worker must scope the managed MCP endpoint"
@@ -77,6 +78,7 @@ def test_worker_overrides_target_the_migrated_server(launch, tmp_path):
     migrated = _migrated_server_names(tmp_path)
     assert targeted <= migrated, f"overrides target {targeted - migrated}, which codex has no transport for"
     assert any(arg.startswith(f"mcp_servers.{next(iter(targeted))}.env.HERMES_KANBAN_TASK=") for arg in overrides)
+    assert any(arg == f'mcp_servers.{next(iter(targeted))}.env.HERMES_PROFILE="turing"' for arg in overrides)
 
 
 def test_only_dispatcher_owned_workers_get_mcp_overrides(launch):

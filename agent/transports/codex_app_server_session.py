@@ -262,7 +262,9 @@ class CodexAppServerSession:
         if self._thread_id is not None:
             return self._thread_id
         if self._client is None:
-            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
+            self._client = self._client_factory(
+                codex_bin=self._codex_bin, codex_home=self._codex_home,
+                **({"model_provider": self._model_provider} if self._model_provider else {}))
             self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.

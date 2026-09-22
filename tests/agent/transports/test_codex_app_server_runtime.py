@@ -134,7 +134,7 @@ child = subprocess.Popen(
     [sys.executable, "-c", "import time; time.sleep(60)"],
     start_new_session=True,
 )
-with open(os.environ["CHILD_PID_FILE"], "w", encoding="utf-8") as fh:
+with open(os.path.join(os.environ["TMPDIR"], "child.pid"), "w", encoding="utf-8") as fh:
     fh.write(str(child.pid))
 
 def _exit(_sig, _frame):
@@ -149,7 +149,7 @@ while True:
 
         client = CodexAppServerClient(
             codex_bin=str(fake_codex),
-            env={"CHILD_PID_FILE": str(child_pid_file)},
+            env={"TMPDIR": str(tmp_path)},
         )
         try:
             deadline = time.time() + 5
@@ -328,7 +328,7 @@ class TestSpawnEnvSecretStripping:
     """
 
     @staticmethod
-    def _capture_spawn_env(monkeypatch):
+    def _capture_spawn_env(monkeypatch, overrides=None):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -356,7 +356,7 @@ class TestSpawnEnvSecretStripping:
                 pass
 
         monkeypatch.setattr(subprocess, "Popen", FakePopen)
-        client = cas.CodexAppServerClient(codex_bin="codex")
+        client = cas.CodexAppServerClient(codex_bin="codex", env=overrides)
         client._closed = True
         return captured["env"]
 
@@ -388,3 +388,41 @@ class TestSpawnEnvSecretStripping:
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
 
+    def test_unrelated_ambient_credentials_are_not_inherited(self, monkeypatch):
+        for name in ("ANTHROPIC_API_KEY", "UNLISTED_SERVICE_CREDENTIAL", "AWS_SESSION_TOKEN"):
+            monkeypatch.setenv(name, "sentinel-not-a-credential")
+        env = self._capture_spawn_env(monkeypatch)
+        assert not {"ANTHROPIC_API_KEY", "UNLISTED_SERVICE_CREDENTIAL", "AWS_SESSION_TOKEN"} & env.keys()
+
+    def test_explicit_overrides_cannot_restore_unrelated_credentials(self, monkeypatch):
+        env = self._capture_spawn_env(monkeypatch, overrides={
+            "GH_TOKEN": "sentinel",
+            "ANTHROPIC_API_KEY": "sentinel",
+            "UNLISTED_SERVICE_CREDENTIAL": "sentinel",
+            "TMPDIR": "/tmp/codex-test",
+        })
+        assert not {"GH_TOKEN", "ANTHROPIC_API_KEY", "UNLISTED_SERVICE_CREDENTIAL"} & env.keys()
+        assert env["TMPDIR"] == "/tmp/codex-test"
+
+    def test_overridden_codex_home_selects_matching_provider_credential(
+        self, monkeypatch, tmp_path,
+    ):
+        ambient = tmp_path / "ambient"
+        selected = tmp_path / "selected"
+        ambient.mkdir()
+        selected.mkdir()
+        (ambient / "config.toml").write_text('model_provider = "openai"\n')
+        (selected / "config.toml").write_text(
+            'model_provider = "selected"\n'
+            '[model_providers.selected]\n'
+            'env_key = "SELECTED_PROVIDER_API_KEY"\n'
+        )
+        monkeypatch.setenv("CODEX_HOME", str(ambient))
+        monkeypatch.setenv("OPENAI_API_KEY", "ambient-marker")
+        monkeypatch.setenv("SELECTED_PROVIDER_API_KEY", "selected-marker")
+
+        env = self._capture_spawn_env(
+            monkeypatch, overrides={"CODEX_HOME": str(selected)})
+        assert env["CODEX_HOME"] == str(selected)
+        assert env["SELECTED_PROVIDER_API_KEY"] == "selected-marker"
+        assert "OPENAI_API_KEY" not in env

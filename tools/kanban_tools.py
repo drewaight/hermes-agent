@@ -235,7 +235,7 @@ def _enforce_worker_task_ownership(tid: str) -> None:
     if env_tid and tid != env_tid:
         raise _Reject(
             f"worker is scoped to task {env_tid}; refusing to mutate {tid}. Use kanban_comment "
-            f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
+            "to hand off information to other tasks or request follow-up work from the orchestrator.")
 
 
 def _worker_guard(tool_name: str, args: dict) -> str:
@@ -1013,8 +1013,9 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
 
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
-    """Create a (child) task; orchestrator workers use this to fan out."""
+    """Create a task from an orchestrator without task-scoped worker identity."""
     _reject_delegated_child_mutation("kanban_create")
+    _require_orchestrator_tool("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
@@ -1163,10 +1164,9 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child dependency edge after the fact (cycles/self-links/running
-    children → ValueError). A worker linking its OWN running card proves ownership
-    with its run id so the dependency-block handoff still works."""
+    """Add a dependency edge from an orchestrator, never a dispatcher worker."""
     _reject_delegated_child_mutation("kanban_link")
+    _require_orchestrator_tool("kanban_link")
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
