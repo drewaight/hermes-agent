@@ -28,6 +28,39 @@ _codex_watchdog_state_var: contextvars.ContextVar[Any | None] = contextvars.Cont
 
 _DEFAULT_STREAM_DRAIN_TIMEOUT = 2.0
 
+# Mirrors hermes_cli.kanban_db_dispatch.KANBAN_TERMINAL_TIMEOUT_GRACE_SECONDS: leave the worker
+# enough wall clock, after codex's own turn deadline fires, to interrupt cleanly and hand control
+# back before the dispatcher's SIGTERM/SIGKILL lands.
+_CODEX_TURN_TIMEOUT_GRACE_SECONDS = 30.0
+_DEFAULT_CODEX_TURN_TIMEOUT = 600.0
+
+
+def _resolve_codex_turn_timeout(default: float = _DEFAULT_CODEX_TURN_TIMEOUT) -> float:
+    """Bound ``CodexAppServerSession.run_turn``'s deadline by the task's real runtime budget.
+
+    ``run_turn``'s own default (600s) is otherwise disconnected from a kanban card's
+    ``max_runtime_seconds`` (often much longer, e.g. 2700s): codex drives an entire task as ONE
+    continuous turn — including any native ``kanban_block``/``kanban_complete`` tool call codex
+    makes for itself — so a flat 600s deadline interrupts and retires that turn long before the
+    card's real budget is exhausted, regardless of how much time the card actually granted
+    (OPS-CODEX-TURN-DEADLINE-01). ``HERMES_KANBAN_DEADLINE_EPOCH`` (set by the dispatcher from
+    ``task.max_runtime_seconds``) is the only source of that budget: absent, malformed, or a
+    non-kanban session (CLI/gateway chat) keeps the historical 600s default unchanged.
+
+    Never returns more than the real remaining time: when the deadline has already passed (a
+    stale/expired env value), falls back to a short floor so codex is interrupted fast rather than
+    resurrecting the full 600s default and getting SIGKILLed mid-turn with no chance to report.
+    """
+    raw = os.environ.get("HERMES_KANBAN_DEADLINE_EPOCH", "").strip()
+    if not raw:
+        return default
+    try:
+        deadline_epoch = float(raw)
+    except ValueError:
+        return default
+    remaining = deadline_epoch - time.time() - _CODEX_TURN_TIMEOUT_GRACE_SECONDS
+    return max(remaining, 5.0)
+
 
 def _stream_drain_timeout() -> float:
     """``agent.stream_drain_timeout`` (seconds) — how long the post-terminal SSE drain may block.
@@ -670,7 +703,7 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=user_message, turn_timeout=_resolve_codex_turn_timeout())
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)

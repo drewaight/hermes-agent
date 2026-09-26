@@ -2571,6 +2571,23 @@ def _worker_terminal_timeout_env(
     return str(desired)
 
 
+def _worker_deadline_epoch_env(max_runtime_seconds: Optional[int], *, now: Optional[float] = None) -> Optional[str]:
+    """Absolute wall-clock deadline for this attempt, derived from the card's own
+    ``max_runtime_seconds``. ``agent.codex_runtime._resolve_codex_turn_timeout()`` reads
+    ``HERMES_KANBAN_DEADLINE_EPOCH`` to bound a codex app-server turn's internal deadline by the
+    card's real budget instead of its hardcoded 600s default (OPS-CODEX-TURN-DEADLINE-01).
+    ``None`` for tasks with no runtime cap or a malformed value — codex_runtime then keeps its
+    historical default, matching non-kanban sessions.
+    """
+    if max_runtime_seconds is None:
+        return None
+    try:
+        runtime = int(max_runtime_seconds)
+    except (TypeError, ValueError):
+        return None
+    return str((now if now is not None else time.time()) + runtime)
+
+
 @contextlib.contextmanager
 def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
     """Bind an assigned profile's runtime scope (secrets + terminal policy, optionally home) for
@@ -2852,6 +2869,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         override = _worker_terminal_timeout_env(task.max_runtime_seconds, env.get(var))
         if override is not None:
             env[var] = override
+    deadline_epoch = _worker_deadline_epoch_env(task.max_runtime_seconds)
+    if deadline_epoch is not None:
+        env["HERMES_KANBAN_DEADLINE_EPOCH"] = deadline_epoch
     # Pin the board DB + workspaces root so the worker's kanban paths still
     # match after `hermes -p` rewrites HERMES_HOME (symlink / Docker layouts).
     env["HERMES_KANBAN_DB"] = str(_kb.kanban_db_path(board=board))
