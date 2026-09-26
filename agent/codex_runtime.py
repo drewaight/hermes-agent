@@ -8,6 +8,7 @@ import contextvars
 import functools
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -57,6 +58,10 @@ def _resolve_codex_turn_timeout(default: float = _DEFAULT_CODEX_TURN_TIMEOUT) ->
     try:
         deadline_epoch = float(raw)
     except ValueError:
+        return default
+    if not math.isfinite(deadline_epoch):
+        # "nan"/"inf"/"-inf" all parse as floats but a non-finite deadline can't bound anything —
+        # treat it the same as absent/malformed rather than disabling the timeout.
         return default
     remaining = deadline_epoch - time.time() - _CODEX_TURN_TIMEOUT_GRACE_SECONDS
     return max(remaining, 5.0)

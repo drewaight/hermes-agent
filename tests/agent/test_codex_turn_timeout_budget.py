@@ -53,6 +53,18 @@ def test_malformed_env_falls_back_to_default(monkeypatch, bad_value):
     assert _resolve_codex_turn_timeout() == _DEFAULT_CODEX_TURN_TIMEOUT
 
 
+@pytest.mark.parametrize("nonfinite_value", ["nan", "NaN", "inf", "Infinity", "-inf", "-Infinity"])
+def test_nonfinite_env_falls_back_to_default(monkeypatch, nonfinite_value):
+    """``float()`` happily parses "nan"/"inf"/"-inf" — a non-finite deadline can't bound a
+    remaining-time computation, so it must be rejected like a malformed value, never returned
+    as-is (which would compute a NaN/±inf turn_timeout and effectively disable the deadline)."""
+    monkeypatch.setenv("HERMES_KANBAN_DEADLINE_EPOCH", nonfinite_value)
+    timeout = _resolve_codex_turn_timeout()
+    assert timeout == _DEFAULT_CODEX_TURN_TIMEOUT
+    assert timeout == timeout  # not NaN
+    assert timeout not in (float("inf"), float("-inf"))
+
+
 def test_run_codex_app_server_turn_passes_resolved_timeout(monkeypatch):
     """The call site must actually thread the resolved value into run_turn, not just compute it."""
     import agent.codex_runtime as codex_runtime
