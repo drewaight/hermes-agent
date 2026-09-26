@@ -113,6 +113,15 @@ class CodexAppServerClient:
                 if key in os.environ:
                     cmd += ["-c", f"mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.env.{key}={json.dumps(os.environ[key])}"]
             cmd += ["-c", f'mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.env.{DELEGATED_CHILD_ENV_MARKER}=""']
+            # A dispatcher-owned worker's cwd is often a candidate worktree, not the PM-current
+            # checkout. Without this, `python -m agent.transports.hermes_tools_mcp_server`
+            # inherits that cwd as sys.path[0] (implicit `-m` behavior) and shadows the installed
+            # `agent`/`hermes_bootstrap` with the worktree's copy; hermes_bootstrap then finds the
+            # worktree isn't PM-"current" and execv's into a concurrently-provisioned venv,
+            # crashing before the MCP `initialize` response (t_e6a07577). PYTHONSAFEPATH=1 drops
+            # that implicit cwd entry so the helper always resolves the installed, PM-current
+            # copy — scoped to this per-invocation override, never the shared config.toml.
+            cmd += ["-c", f'mcp_servers.{HERMES_TOOLS_MCP_SERVER_NAME}.env.PYTHONSAFEPATH="1"']
         spawn_env = delegated_child_subprocess_env(spawn_env)
         # Kanban workers must write handoff/status to the board DB outside the
         # workspace: keep the sandbox on, add the Kanban root as writable.

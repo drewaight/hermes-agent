@@ -87,3 +87,16 @@ def test_only_dispatcher_owned_workers_get_mcp_overrides(launch):
     assert launch({}) == []
     with non_dispatcher_owned_context():
         assert launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"}) == []
+
+
+def test_worker_pins_pythonsafepath_on_the_hermes_tools_entry(launch, tmp_path):
+    """Regression for t_a7acad11 / t_e6a07577: a dispatcher-owned worker's cwd is often a
+    candidate worktree. Without PYTHONSAFEPATH, ``python -m
+    agent.transports.hermes_tools_mcp_server`` implicitly puts that cwd on sys.path[0] and
+    shadows the installed ``agent``/``hermes_bootstrap`` with the worktree's copy, which then
+    execv's into a possibly-still-provisioning PM venv before the MCP ``initialize`` response
+    (reproduced 3/3 from worktree cwd). Only a dispatcher-owned worker gets the override — an
+    ordinary launch must not silently change the shared entry's import behavior."""
+    overrides = launch({"HERMES_KANBAN_TASK": "11111111-1111-4111-8111-111111111111"})
+    assert f'mcp_servers.{next(iter(_migrated_server_names(tmp_path)))}.env.PYTHONSAFEPATH="1"' in overrides
+    assert launch({}) == []
