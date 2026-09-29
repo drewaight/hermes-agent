@@ -597,6 +597,31 @@ def _cmd_set_model(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_max_retries(args: argparse.Namespace) -> int:
+    value = args.value
+    if value is not None and value.lower() in {"none", "-", "null", ""}:
+        value = None
+    if value is not None:
+        try:
+            value = int(value)
+        except ValueError:
+            return _err("kanban set-max-retries: value must be an integer, or 'none' to clear", 2)
+    try:
+        with kbc.connect_closing() as conn:
+            ok = kb.set_max_retries(conn, args.task_id, value)
+    except ValueError as exc:
+        return _err(f"kanban: {exc}", 2)
+    if not ok:
+        return _err(f"no such task: {args.task_id}")
+    if value is not None:
+        print(f"Set max_retries override on {args.task_id}: {value} "
+              f"(blocks after {value} consecutive failure{'s' if value != 1 else ''})")
+    else:
+        print(f"Cleared max_retries override on {args.task_id} "
+              f"(falls back to kanban.failure_limit / dispatcher default)")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kbc.connect_closing() as conn:
         ok = kb.reclaim_task(conn, args.task_id, reason=getattr(args, "reason", None))
@@ -1320,6 +1345,7 @@ _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
+    "set-max-retries": _cmd_set_max_retries,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
     "link": _cmd_link, "unlink": _cmd_unlink, "claim": _cmd_claim,

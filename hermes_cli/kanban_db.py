@@ -1627,6 +1627,31 @@ def set_reasoning_effort(conn: sqlite3.Connection, task_id: str, effort: Optiona
     )
 
 
+def set_max_retries(conn: sqlite3.Connection, task_id: str, max_retries: Optional[int]) -> bool:
+    """Set (``None`` clears) the per-task failure-breaker override on an
+    existing, NON-RUNNING task. ``max_retries`` is the consecutive-failure
+    count at which the breaker trips (``1`` blocks on the first failure —
+    see the ``tasks.max_retries`` column comment); it must be a positive
+    int when given. Refused (``ValueError``) while the task is ``running``
+    (an in-flight worker's trip threshold must not move under it) or
+    ``archived``, mirroring the other per-task overrides' archived guard."""
+    if max_retries is not None:
+        if isinstance(max_retries, bool) or not isinstance(max_retries, int):
+            raise ValueError("max_retries must be a positive integer (or None to clear)")
+        if max_retries < 1:
+            raise ValueError("max_retries must be a positive integer (or None to clear)")
+    with write_txn(conn):
+        status = _task_status(conn, task_id)
+        if status is None:
+            return False
+        if status in ("running", "archived"):
+            raise ValueError(f"cannot set max_retries on a {status} task {task_id}")
+        conn.execute("UPDATE tasks SET max_retries = ? WHERE id = ?", (max_retries, task_id))
+        _append_event(conn, task_id, "max_retries_set", {"max_retries": max_retries})
+    notify_task_updated(conn, task_id, ("max_retries",))
+    return True
+
+
 # --- Links ---
 
 def link_tasks(

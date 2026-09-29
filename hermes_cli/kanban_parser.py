@@ -257,6 +257,13 @@ _SPECS = [
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
     ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
+    _cmd("set-max-retries", [
+        _TASK_ID,
+        _arg("value", nargs="?",
+             help="Failure-breaker trip threshold: positive int (1 = block on the first "
+                  "failure), or 'none'/omitted to clear back to the dispatcher default. "
+                  "Refused while the task is running."),
+    ], help="Set or clear a task's per-card max_retries override on a nonrunning task"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
