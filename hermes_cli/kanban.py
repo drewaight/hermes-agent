@@ -207,7 +207,7 @@ def _profile_author() -> str:
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
-    "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
+    "schedule", "unblock", "promote", "recover", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
@@ -1143,6 +1143,26 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_recover(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban recover is orchestrator-only; workers must hand off their assigned task")
+    reason = _joined_words(args.reason)
+    author = _profile_author()
+    with kbc.connect_closing() as conn:
+        ok, err = kb.recover_triage_task(conn, args.task_id, actor=author, reason=reason or "")
+        landed = kb.get_task(conn, args.task_id) if ok else None
+    landed_status = landed.status if landed is not None else None
+    if getattr(args, "json", False):
+        _print_json({"task_id": args.task_id, "recovered": ok, "reason": reason,
+                     "status": landed_status, "error": err})
+        return 0 if ok else 1
+    if ok:
+        print(f"Recovered {args.task_id} -> {landed_status}: {reason}")
+        return 0
+    print(f"cannot recover {args.task_id}: {err}", file=sys.stderr)
+    return 1
+
+
 def _cmd_archive(args: argparse.Namespace) -> int:
     ids = list(args.task_ids or [])
     purge_ids = list(getattr(args, "purge_ids", None) or [])
@@ -1354,7 +1374,7 @@ _HANDLERS = {
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
-    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
+    "reopen-review": _cmd_reopen_review, "promote": _cmd_promote, "recover": _cmd_recover,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,
     "daemon": _cmd_daemon, "watch": _cmd_watch, "stats": _cmd_stats,
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,

@@ -361,6 +361,13 @@ _SPECS = [
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    _cmd("recover", [
+        _TASK_ID,
+        _arg("reason", nargs="+", help="Required: the qualification that clears the unblock-loop condition"),
+        _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
+    ], help="Move a task the unblock-loop breaker routed to triage (block_loop_detected) "
+            "back to its resumable phase — ready/todo/review. Does not apply to a freshly "
+            "created triage task awaiting `specify`/`decompose`."),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",

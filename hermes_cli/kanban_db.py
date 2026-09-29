@@ -3716,6 +3716,66 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def recover_triage_task(
+    conn: sqlite3.Connection, task_id: str, *, actor: str, reason: str,
+) -> tuple[bool, Optional[str]]:
+    """``triage`` -> its resumable phase (same landing rules as
+    :func:`unblock_task`), for a task the unblock-loop breaker routed there
+    (``block_loop_detected``, ``block_kind`` set) once the operator has fixed
+    whatever caused the loop. Narrower than ``specify``/``decompose``, which
+    are for a freshly-created triage task still missing a concrete spec —
+    this never rewrites title/body, only the lifecycle status.
+
+    Requires a non-empty ``reason``: the caller's stated qualification for
+    why the loop condition no longer holds. This is an audit trail, not an
+    automated check — the CLI does not (and cannot generically) verify the
+    domain claim behind it. Refuses a task with no ``block_kind`` (never
+    looped; belongs to ``specify``/``decompose`` instead). Preserves task id,
+    dependencies, run history, assignee, workspace and branch untouched;
+    resets ``block_kind``/``block_recurrences``/``consecutive_failures`` the
+    same as a normal unblock so the loop breaker doesn't immediately refire.
+    """
+    if not reason or not reason.strip():
+        return False, "recover requires a non-empty reason (the stated qualification)"
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False, f"task {task_id} not found"
+        if row["status"] != "triage":
+            return False, f"task {task_id} is {row['status']!r}; recover only applies to 'triage'"
+        if row["block_kind"] is None:
+            return False, (
+                f"task {task_id} has no block_kind — it is a fresh triage task awaiting "
+                f"`specify`/`decompose`, not an unblock-loop recovery"
+            )
+        _reclaim_dangling_run(
+            conn, task_id, statuses=("triage",), now=now,
+            note="invariant recovery on triage recover",
+        )
+        resume_status = _resume_status_from_events(conn, task_id)
+        landing_status = _landing_status_after_parents(conn, task_id)
+        new_status = (
+            "review" if landing_status == "ready" and resume_status == "review"
+            else landing_status
+        )
+        cur = conn.execute(
+            "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "block_kind = NULL, block_recurrences = 0 "
+            "WHERE id = ? AND status = 'triage'", (new_status, task_id),
+        )
+        if cur.rowcount != 1:
+            return False, f"task {task_id} status changed during recovery"
+        _append_event(
+            conn, task_id, "triage_recovered",
+            {"actor": actor, "reason": reason, "status": new_status},
+        )
+        return True, None
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
