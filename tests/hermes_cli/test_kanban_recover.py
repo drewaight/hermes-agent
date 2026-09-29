@@ -155,3 +155,45 @@ def test_cli_recover_refused_for_delegated_worker(kanban_home, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_whatever")
     rc = kb_cli._cmd_recover(_recover_ns("t_whatever"))
     assert rc != 0
+
+
+# ---------------------------------------------------------------------------
+# Public-command regression: `kanban_command()` (the real `hermes kanban recover`
+# path) for inherited-but-unowned env vs. a genuinely fenced delegated child.
+# ---------------------------------------------------------------------------
+
+
+def _recover_command_ns(task_id, *, reason=("qualification",)):
+    return argparse.Namespace(
+        kanban_action="recover", task_id=task_id, reason=list(reason), json=False, board=None,
+    )
+
+
+def test_recover_command_allowed_for_inherited_unfenced_env(kanban_home, monkeypatch):
+    """A non-dispatcher-owned execution (e.g. a delegate_task child or cron run) that merely
+    *inherited* HERMES_KANBAN_TASK from a dispatcher-owned parent, with no path fence in play,
+    must not be denied -- see t_e608e3c4's review of the bare env-var check."""
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    with kbc.connect() as c:
+        task_id, _ = _looped_triage_task(c, n_parents=0)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_someone_elses_task")
+    with non_dispatcher_owned_context():
+        rc = kb_cli.kanban_command(_recover_command_ns(task_id))
+    assert rc == 0
+    with kbc.connect() as c:
+        assert kb.get_task(c, task_id).status == "ready"
+
+
+def test_recover_command_denied_for_fenced_delegated_child(kanban_home, monkeypatch):
+    """A genuinely fenced delegate_task child (in-process delegated context) is still denied,
+    via the path-fence guard in `kanban_command()`, regardless of ownership semantics."""
+    from agent.delegation_context import delegated_child_context
+
+    with kbc.connect() as c:
+        task_id, _ = _looped_triage_task(c, n_parents=0)
+    with delegated_child_context():
+        rc = kb_cli.kanban_command(_recover_command_ns(task_id))
+    assert rc != 0
+    with kbc.connect() as c:
+        assert kb.get_task(c, task_id).status == "triage"

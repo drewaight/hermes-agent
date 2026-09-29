@@ -1144,7 +1144,14 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
 
 def _cmd_recover(args: argparse.Namespace) -> int:
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    # `owned_kanban_task()` (not a bare env-var check): a delegate_task child or cron run that
+    # merely *inherited* HERMES_KANBAN_TASK from a dispatcher-owned parent is not itself the
+    # dispatcher-owned worker, so it must not be misread as "the assigned worker is self-servicing
+    # recover" — genuinely fenced descendants are already denied by the path-fence guard in
+    # `kanban_command()` (`_is_delegated_child_cli_mutation`), which runs before this handler.
+    from agent.delegation_context import owned_kanban_task
+
+    if owned_kanban_task():
         return _err("kanban recover is orchestrator-only; workers must hand off their assigned task")
     reason = _joined_words(args.reason)
     author = _profile_author()
