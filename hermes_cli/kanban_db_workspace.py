@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import contextlib
 
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli._subprocess_compat import noninteractive_git_env
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -49,14 +50,21 @@ _ACTIVE_CHILDREN_SQL = (
 _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM tasks WHERE id = ?"
 
 
-def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
-    """``git -C repo_root args``; never raises on a non-zero exit."""
+def _git(
+    repo_root: Path, *args: str, timeout: int,
+    env: Optional[dict] = None, stdin: Optional[int] = None,
+) -> subprocess.CompletedProcess:
+    """``git -C repo_root args``; never raises on a non-zero exit (CAN raise
+    ``subprocess.TimeoutExpired`` — callers that might hit a hung/prompting
+    git (e.g. a fetch) must guard for it themselves)."""
     return subprocess.run(
         ["git", "-C", str(repo_root), *args],
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         timeout=timeout,
         check=False,
+        env=env,
+        stdin=stdin,
     )
 
 
@@ -438,17 +446,97 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
-    """Materialize ``target`` as a linked git worktree under ``repo_root``."""
+def _new_branch_base_ref(repo_root: Path) -> tuple[str, Optional[str]]:
+    """Ref to base a brand-new task branch on (#86574), plus why we fell back if we did.
+
+    The primary checkout's local HEAD can be arbitrarily stale (nobody runs
+    ``git pull`` on it between dispatches), so basing a new task branch on it
+    silently forks work off old history. Fetch ``origin`` and base on the
+    verified ``origin/main``; if the repo doesn't call its default branch
+    ``main``, fall back to the remote's actual default branch
+    (``origin/HEAD``). Returns ``(ref, None)`` on a verified fetch, or
+    ``(\"HEAD\", reason)`` for every fallback case — including a genuinely
+    local-only repo — so the caller can warn/record exactly why.
+
+    ``fetch``/``rev-parse --verify`` run with a closed stdin and a
+    non-interactive git env so a credential prompt can never hang the
+    dispatcher; a ``TimeoutExpired`` is treated the same as a failed call.
+    """
+    env = noninteractive_git_env()
+    try:
+        fetch = _git(repo_root, "fetch", "origin", timeout=60, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return "HEAD", "git fetch origin timed out"
+    if fetch.returncode != 0:
+        stderr = (fetch.stderr or fetch.stdout or "").strip()[:300]
+        return "HEAD", f"git fetch origin failed: {stderr}" if stderr else "git fetch origin failed"
+
+    try:
+        verify_main = _git(
+            repo_root, "rev-parse", "--verify", "-q", "origin/main", timeout=15,
+            env=env, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return "HEAD", "git rev-parse --verify origin/main timed out"
+    if verify_main.returncode == 0:
+        return "origin/main", None
+
+    try:
+        symbolic = _git(
+            repo_root, "symbolic-ref", "--short", "-q", "refs/remotes/origin/HEAD", timeout=15,
+            env=env, stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return "HEAD", "git symbolic-ref refs/remotes/origin/HEAD timed out"
+    remote_default = (symbolic.stdout or "").strip() if symbolic.returncode == 0 else ""
+    if remote_default:
+        try:
+            verify_default = _git(
+                repo_root, "rev-parse", "--verify", "-q", remote_default, timeout=15,
+                env=env, stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            return "HEAD", f"git rev-parse --verify {remote_default} timed out"
+        if verify_default.returncode == 0:
+            return remote_default, None
+
+    return "HEAD", "origin fetched but neither origin/main nor a resolvable remote default branch was found"
+
+
+def _ensure_git_worktree(
+    repo_root: Path, target: Path, branch_name: str, *,
+    conn: Optional[sqlite3.Connection] = None, task_id: Optional[str] = None,
+) -> None:
+    """Materialize ``target`` as a linked git worktree under ``repo_root``.
+
+    ``conn``/``task_id`` are optional and best-effort: when both are given
+    and a brand-new branch falls back to local HEAD, the fallback is also
+    recorded as a durable event on that card. Every fallback is logged
+    regardless of whether a card is available to record it on.
+    """
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
+        # Reuse unchanged: reviews, reworks and handoff recoveries keep their
+        # own history exactly as the owner left it.
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        base_ref, fallback_reason = _new_branch_base_ref(repo_root)
+        if fallback_reason is not None:
+            _kb._log.warning(
+                "kanban worktree: new branch %r in %s falls back to local HEAD: %s",
+                branch_name, repo_root, fallback_reason,
+            )
+            if conn is not None and task_id is not None:
+                with contextlib.suppress(Exception):
+                    _kb._append_event(
+                        conn, task_id, "worktree_new_branch_head_fallback",
+                        {"repo_root": str(repo_root), "branch": branch_name, "reason": fallback_reason},
+                    )
+        args = ["worktree", "add", "-b", branch_name, str(target), base_ref]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
@@ -457,14 +545,18 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
+def _anchored_worktree(
+    repo_root: Path, task_id: str, branch_name: str, *, conn: Optional[sqlite3.Connection] = None,
+) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    _ensure_git_worktree(repo_root, target, branch_name, conn=conn, task_id=task_id)
     return target, branch_name
 
 
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
+def _resolve_worktree_workspace(
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
@@ -493,7 +585,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, conn=conn)
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -516,7 +608,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, conn=conn, task_id=task.id)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
@@ -524,7 +616,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(repo_root, task.id, branch_name, conn=conn)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -532,11 +624,13 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, conn=conn, task_id=task.id)
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     ``scratch``: ``<board-root>/workspaces/<id>/`` — path-stable across the
@@ -546,10 +640,12 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     worktree; a repo-root ``workspace_path`` anchors ``<repo>/.worktrees/<id>``,
     a concrete path is created/reused, none -> the board's ``default_workdir``
     (raises if unset rather than guessing). Persist via ``set_workspace_path``.
+    ``conn``, if given, lets a worktree's new-branch-falls-back-to-HEAD event
+    (#86574) be recorded on the card; purely best-effort when omitted.
     """
     kind = task.workspace_kind or "scratch"
     if kind == "worktree":
-        return _resolve_worktree_workspace(task, board=board)[0]
+        return _resolve_worktree_workspace(task, board=board, conn=conn)[0]
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":
